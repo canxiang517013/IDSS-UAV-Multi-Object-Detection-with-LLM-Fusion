@@ -1,0 +1,20 @@
+model:
+  detector_weights: "models/weights/best.pt"  # 或自定义 VisDrone 微调模型
+  conf_threshold: 0.4
+  iou_threshold: 0.5
+
+
+visdrone_classes:
+  - pedestrian
+  - people
+  - bicycle
+  - car
+  - van
+  - truck
+  - tricycle
+  - awning-tricycle
+  - bus
+  - motor
+
+llm:
+  analyze_every: 30
