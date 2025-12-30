@@ -5,9 +5,10 @@ import json
 from pathlib import Path
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QLabel, QFileDialog, QMessageBox, QScrollArea, QFrame,QTextEdit
+    QPushButton, QLabel, QFileDialog, QMessageBox, QScrollArea, QFrame,QTextEdit,
+    QCheckBox
 )
-from PyQt5.QtGui import QImage, QPixmap, QFont
+from PyQt5.QtGui import QImage, QPixmap, QFont, QKeyEvent
 from PyQt5.QtCore import QTimer, Qt, QThread, pyqtSignal
 import cv2
 import yaml
@@ -78,8 +79,22 @@ class TrackingApp(QMainWindow):
         self.llm_worker = None
         self.analyze_every = self.cfg.get("llm", {}).get("analyze_every", 30)
 
+        # AirSim相关
+        self.airsim_client = None
+        self.airsim_loader = None
+        self.drone_controller = None
+        self.use_airsim = False
+        
+        # 键盘控制
+        self.keyboard_controller = None
+        self.control_update_timer = QTimer()
+        self.control_update_timer.timeout.connect(self._update_continuous_control)
+
         # 视频状态
         self.is_paused = False
+        
+        # 跟踪目标列表（用于无人机控制）
+        self.tracked_objects = []
 
         # 输出目录
         self.output_dir = Path("outputs")
@@ -148,10 +163,16 @@ class TrackingApp(QMainWindow):
         self.stop_btn.setStyleSheet("padding: 8px; font-size: 14px;")
         self.stop_btn.clicked.connect(self.stop_video)
         self.stop_btn.setEnabled(False)
+        
+        self.airsim_btn = QPushButton("🚁 连接AirSim")
+        self.airsim_btn.setStyleSheet("padding: 8px; font-size: 14px; background-color: #e7f3ff;")
+        self.airsim_btn.clicked.connect(self.toggle_airsim)
 
         control_layout.addWidget(self.open_btn)
         control_layout.addWidget(self.pause_btn)
         control_layout.addWidget(self.stop_btn)
+        control_layout.addSpacing(10)
+        control_layout.addWidget(self.airsim_btn)
         control_layout.addStretch()
 
         # LLM 分析区域
@@ -171,6 +192,39 @@ class TrackingApp(QMainWindow):
 
 
         control_layout.addWidget(self.llm_output)
+        
+        # === 键盘控制面板 ===
+        self.keyboard_panel = QFrame()
+        self.keyboard_panel.setFrameStyle(QFrame.StyledPanel | QFrame.Raised)
+        self.keyboard_panel.setStyleSheet("margin-top: 20px;")
+        keyboard_layout = QVBoxLayout(self.keyboard_panel)
+        
+        keyboard_title = QLabel("⌨️ 键盘控制")
+        keyboard_title.setFont(QFont("Microsoft YaHei", 12, QFont.Bold))
+        keyboard_layout.addWidget(keyboard_title)
+        
+        # 按键说明
+        self.keyboard_help = QLabel()
+        self.keyboard_help.setTextFormat(Qt.RichText)
+        self.keyboard_help.setText(self._get_keyboard_help_text())
+        self.keyboard_help.setStyleSheet("font-size: 11px; line-height: 1.5;")
+        keyboard_layout.addWidget(self.keyboard_help)
+        
+        # 速度显示
+        self.speed_label = QLabel("飞行速度: 5.0 m/s")
+        self.speed_label.setStyleSheet("font-weight: bold; color: #007bff; margin-top: 10px;")
+        keyboard_layout.addWidget(self.speed_label)
+        
+        # 控制开关
+        self.keyboard_enabled_btn = QPushButton("启用键盘控制")
+        self.keyboard_enabled_btn.setCheckable(True)
+        self.keyboard_enabled_btn.setStyleSheet(
+            "padding: 8px; font-size: 14px;"
+        )
+        self.keyboard_enabled_btn.clicked.connect(self._toggle_keyboard_control)
+        keyboard_layout.addWidget(self.keyboard_enabled_btn)
+        
+        control_layout.addWidget(self.keyboard_panel)
 
         main_layout.addWidget(control_panel)
 
@@ -215,9 +269,21 @@ class TrackingApp(QMainWindow):
 
     def stop_video(self):
         self.timer.stop()
+        
+        # 停止视频加载器
         if self.video_loader:
             self.video_loader.release()
             self.video_loader = None
+            
+        # 停止AirSim加载器
+        if self.airsim_loader:
+            self.airsim_loader.stop()
+            self.airsim_loader = None
+        
+        # 如果使用AirSim，断开连接
+        if self.use_airsim:
+            self.stop_airsim()
+        
         self.video_label.setText("视频已停止")
         self.open_btn.setEnabled(True)
         self.pause_btn.setEnabled(False)
@@ -228,12 +294,115 @@ class TrackingApp(QMainWindow):
         self.fps_label.setText("FPS: --")
         self.target_label.setText("目标数: --")
         self.frame_label.setText("帧数: --")
+        self.tracked_objects = []
         logger.info("视频播放已停止")
+    
+    def toggle_airsim(self):
+        """切换AirSim连接"""
+        if not self.use_airsim:
+            # 尝试连接AirSim
+            try:
+                from utils.airsim_client import AirSimClient
+                from utils.airsim_loader import AirSimLoader
+                from utils.drone_controller import DroneController
+                
+                # 从配置文件读取AirSim参数
+                airsim_config = self.cfg.get("airsim", {})
+                ip = airsim_config.get("ip", "127.0.0.1")
+                port = airsim_config.get("port", 41451)
+                
+                self.airsim_client = AirSimClient(ip=ip, port=port)
+                
+                # 显示连接对话框
+                reply = QMessageBox.question(
+                    self, "连接AirSim",
+                    f"确认连接到AirSim仿真环境？\n\nIP: {ip}\n端口: {port}\n\n确保AirSim已启动并处于运行状态。",
+                    QMessageBox.Yes | QMessageBox.No
+                )
+                
+                if reply == QMessageBox.Yes:
+                    if self.airsim_client.connect():
+                        self.airsim_loader = AirSimLoader(self.airsim_client)
+                        self.drone_controller = DroneController(self.airsim_client)
+                        self.use_airsim = True
+                        
+                        # 更新UI
+                        self.airsim_btn.setText("🚁 断开AirSim")
+                        self.airsim_btn.setStyleSheet("padding: 8px; font-size: 14px; background-color: #ffcccc;")
+                        self.open_btn.setEnabled(False)
+                        self.video_label.setText("AirSim已连接，点击暂停开始")
+                        
+                        # 启动定时器
+                        self.timer.start(int(1000 / 30))
+                        self.pause_btn.setEnabled(True)
+                        self.stop_btn.setEnabled(True)
+                        self.is_paused = False
+                        self.frame_count = 0
+                        self.last_time = None
+                        self.status_label.setText("状态: AirSim已连接")
+                        
+                        logger.info("已连接AirSim仿真环境")
+                        QMessageBox.information(self, "成功", "已连接到AirSim仿真环境")
+                    else:
+                        QMessageBox.critical(self, "错误", "连接AirSim失败，请检查AirSim是否正在运行")
+                        self.airsim_client = None
+                else:
+                    self.airsim_client = None
+                    
+            except ImportError as e:
+                QMessageBox.critical(self, "错误", f"缺少AirSim依赖: {e}\n请运行: pip install airsim")
+                logger.error(f"缺少AirSim依赖: {e}")
+            except Exception as e:
+                QMessageBox.critical(self, "错误", f"连接AirSim异常: {e}")
+                logger.error(f"连接AirSim异常: {e}")
+        else:
+            # 断开AirSim
+            self.stop_airsim()
+    
+    def stop_airsim(self):
+        """停止AirSim连接"""
+        # 禁用键盘控制
+        if self.keyboard_controller:
+            self.keyboard_controller.set_enabled(False)
+            self.control_update_timer.stop()
+            self.keyboard_enabled_btn.setChecked(False)
+            self.keyboard_enabled_btn.setText("启用键盘控制")
+            self.keyboard_enabled_btn.setStyleSheet(
+                "padding: 8px; font-size: 14px; background-color: #e7f3ff;"
+            )
+        
+        if self.airsim_loader:
+            self.airsim_loader.stop()
+            self.airsim_loader = None
+        
+        if self.airsim_client:
+            self.airsim_client.disconnect()
+            self.airsim_client = None
+        
+        self.drone_controller = None
+        self.use_airsim = False
+        
+        # 更新UI
+        self.airsim_btn.setText("🚁 连接AirSim")
+        self.airsim_btn.setStyleSheet("padding: 8px; font-size: 14px; background-color: #e7f3ff;")
+        self.open_btn.setEnabled(True)
+        
+        logger.info("已断开AirSim连接")
 
     def update_frame(self):
         start_time = time.time()
         try:
-            frame = next(self.video_loader)
+            # 根据数据源获取图像
+            if self.use_airsim and self.airsim_loader:
+                # 从AirSim获取图像
+                if not self.airsim_loader.is_running:
+                    self.airsim_loader.start()
+                frame = next(self.airsim_loader)
+            else:
+                # 从视频文件获取图像
+                frame = next(self.video_loader)
+            
+            # 目标检测与跟踪
             results = self.model.track(
                 frame,
                 conf=self.cfg["model"]["conf_threshold"],
@@ -263,6 +432,9 @@ class TrackingApp(QMainWindow):
                     "bbox": [x1, y1, x2, y2],
                     "distance": distance
                 })
+            
+            # 保存跟踪目标列表（用于无人机控制）
+            self.tracked_objects = tracked_objs
 
             # 更新状态
             self.frame_count += 1
@@ -309,13 +481,101 @@ class TrackingApp(QMainWindow):
             QMessageBox.critical(self, "错误", f"视频处理异常:\n{str(e)}")
 
     def on_llm_result(self, result: str):
-        # 设置文本并自动滚动到底部（适合流式输出，此处为一次性）
+        """处理LLM分析结果"""
+        # 设置文本并自动滚动到底部
         self.llm_output.setPlainText(result)
         self.llm_output.verticalScrollBar().setValue(
             self.llm_output.verticalScrollBar().maximum()
         )
+        
+        # 如果连接了AirSim且启用了控制，执行无人机控制
+        if self.use_airsim and self.drone_controller and self.tracked_objects:
+            try:
+                # 解析LLM指令
+                command = self.drone_controller.parse_llm_command(result)
+                if command:
+                    logger.info(f"解析到控制指令: {command}")
+                    # 执行控制指令
+                    self.drone_controller.execute_command(command, self.tracked_objects)
+                else:
+                    logger.debug("LLM分析中未包含可执行的控制指令")
+            except Exception as e:
+                logger.error(f"无人机控制执行失败: {e}")
+        
         logger.info("LLM 分析完成")
 
+    def _get_keyboard_help_text(self) -> str:
+        """生成键盘帮助文本"""
+        help_text = """
+        <table>
+        <tr><td><b>W</b></td><td>前进</td></tr>
+        <tr><td><b>S</b></td><td>后退</td></tr>
+        <tr><td><b>A</b></td><td>向左</td></tr>
+        <tr><td><b>D</b></td><td>向右</td></tr>
+        <tr><td><b>Q</b></td><td>左转</td></tr>
+        <tr><td><b>E</b></td><td>右转</td></tr>
+        <tr><td><b>PageUp</b></td><td>上升</td></tr>
+        <tr><td><b>PageDown</b></td><td>下降</td></tr>
+        <tr><td><b>空格</b></td><td>悬停</td></tr>
+        <tr><td><b>+/-</b></td><td>加速/减速</td></tr>
+        <tr><td><b>R</b></td><td>重置</td></tr>
+        </table>
+        """
+        return help_text
+    
+    def _toggle_keyboard_control(self, enabled: bool):
+        """切换键盘控制"""
+        if not self.use_airsim:
+            QMessageBox.warning(self, "提示", "请先连接AirSim")
+            self.keyboard_enabled_btn.setChecked(False)
+            return
+        
+        if enabled:
+            if not self.keyboard_controller:
+                from utils.keyboard_controller import KeyboardController
+                self.keyboard_controller = KeyboardController(self.airsim_client)
+            
+            self.keyboard_controller.set_enabled(True)
+            self.control_update_timer.start(50)  # 20Hz更新频率
+            self.keyboard_enabled_btn.setText("禁用键盘控制")
+            self.keyboard_enabled_btn.setStyleSheet(
+                "padding: 8px; font-size: 14px; background-color: #ffcccc;"
+            )
+            self.video_label.setFocus()  # 设置焦点以接收键盘事件
+            logger.info("键盘控制已启用")
+        else:
+            if self.keyboard_controller:
+                self.keyboard_controller.set_enabled(False)
+            self.control_update_timer.stop()
+            self.keyboard_enabled_btn.setText("启用键盘控制")
+            self.keyboard_enabled_btn.setStyleSheet(
+                "padding: 8px; font-size: 14px; background-color: #e7f3ff;"
+            )
+            logger.info("键盘控制已禁用")
+    
+    def _update_continuous_control(self):
+        """更新连续控制"""
+        if self.keyboard_controller:
+            self.keyboard_controller.update_continuous_control()
+            
+            # 更新速度显示
+            if self.keyboard_controller:
+                self.speed_label.setText(
+                    f"飞行速度: {self.keyboard_controller.get_speed():.1f} m/s"
+                )
+    
+    def keyPressEvent(self, event: QKeyEvent):
+        """处理按键按下事件"""
+        super().keyPressEvent(event)
+        if self.keyboard_controller:
+            self.keyboard_controller.on_key_press(event.key())
+    
+    def keyReleaseEvent(self, event: QKeyEvent):
+        """处理按键释放事件"""
+        super().keyReleaseEvent(event)
+        if self.keyboard_controller:
+            self.keyboard_controller.on_key_release(event.key())
+    
     def closeEvent(self, event):
         self.stop_video()
         event.accept()

@@ -18,3 +18,21 @@ visdrone_classes:
 
 llm:
   analyze_every: 30
+
+# AirSim仿真平台配置
+airsim:
+  enabled: false  # 是否默认启用AirSim
+  ip: "127.0.0.1"  # AirSim服务器IP地址
+  port: 41451  # AirSim服务器端口
+  camera_name: "0"  # 摄像头名称（默认"0"为主摄像头）
+  control_enabled: false  # 是否启用自动控制（根据LLM决策控制无人机）
+
+# 键盘控制配置
+keyboard:
+  enabled: false  # 是否默认启用键盘控制
+  default_speed: 5.0  # 默认速度 m/s
+  rotation_speed: 30.0  # 旋转速度 度/秒
+  vertical_speed: 2.0  # 垂直速度 m/s
+  max_speed: 20.0  # 最大速度 m/s
+  min_speed: 1.0  # 最小速度 m/s
+  update_frequency: 50  # 更新频率（毫秒），50ms = 20Hz
